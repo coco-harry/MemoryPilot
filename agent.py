@@ -16,8 +16,15 @@ between runs except what's in Sibyl's database on disk.
 import asyncio
 import json
 import os
+import base64
+import requests
 from openai import OpenAI
 from dotenv import load_dotenv
+from eth_account import Account
+from x402 import x402ClientSync
+from x402.http.clients import wrapRequestsWithPayment
+from x402.mechanisms.evm.exact import register_exact_evm_client
+from x402.mechanisms.evm.signers import EthAccountSigner
 from memory_client import remember, search, list_all
 
 load_dotenv()
@@ -28,6 +35,42 @@ client = OpenAI(
 )
 
 MODEL = "anthropic/claude-sonnet-5"
+
+# Set up the paid web search client (x402 on Base) once, at startup
+_agent_account = Account.from_key(os.environ["AGENT_WALLET_PRIVATE_KEY"])
+_x402_client = x402ClientSync()
+register_exact_evm_client(_x402_client, EthAccountSigner(_agent_account), networks="eip155:*")
+_paid_session = wrapRequestsWithPayment(requests.Session(), _x402_client)
+
+
+def paid_web_search(query: str) -> str:
+    """
+    Performs a real web search by autonomously paying a small amount of
+    USDC on Base to Exa's search API via the x402 protocol. Returns the
+    results as a string, plus the on-chain transaction hash as proof.
+    """
+    response = _paid_session.post(
+        "https://api.exa.ai/search",
+        json={"query": query, "numResults": 3},
+    )
+    if response.status_code != 200:
+        return f"Search failed (status {response.status_code}): {response.text}"
+
+    data = response.json()
+    lines = []
+    for r in data.get("results", []):
+        lines.append(f"- {r.get('title')} ({r.get('url')})")
+
+    payment_header = response.headers.get("PAYMENT-RESPONSE")
+    tx_hash = None
+    if payment_header:
+        receipt = json.loads(base64.b64decode(payment_header))
+        tx_hash = receipt.get("transaction")
+
+    result = "Search results:\n" + "\n".join(lines)
+    if tx_hash:
+        result += f"\n\n(Paid for via Base on-chain transaction: {tx_hash})"
+    return result
 
 TOOLS = [
     {
@@ -74,6 +117,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "paid_web_search",
+            "description": (
+                "Search the live web for current information (e.g. news about "
+                "a specific crypto token, project, or company) by autonomously "
+                "paying a small amount of USDC on Base. Use this when you need "
+                "up-to-date, real-world information to evaluate something the "
+                "user is asking about -- not for general knowledge you already have."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -90,6 +153,9 @@ async def run_tool(name: str, args: dict) -> str:
     if name == "search_memory":
         result = await search(args["query"])
         return json.dumps(result)
+
+    if name == "paid_web_search":
+        return paid_web_search(args["query"])
 
     return f"Unknown tool: {name}"
 

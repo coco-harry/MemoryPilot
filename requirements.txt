@@ -1,3 +1,7 @@
 mcp
 openai
 python-dotenv
+eth-account
+web3
+x402[requests,evm]
+
