@@ -25,7 +25,7 @@ from x402 import x402ClientSync
 from x402.http.clients import wrapRequestsWithPayment
 from x402.mechanisms.evm.exact import register_exact_evm_client
 from x402.mechanisms.evm.signers import EthAccountSigner
-from memory_client import remember, search, list_all
+from memory_client import remember, search, list_all, set_state, get_state, record_event
 
 load_dotenv()
 
@@ -43,11 +43,29 @@ register_exact_evm_client(_x402_client, EthAccountSigner(_agent_account), networ
 _paid_session = wrapRequestsWithPayment(requests.Session(), _x402_client)
 
 
-def paid_web_search(query: str) -> str:
+async def log_risk_usage(amount_usd: float, note: str) -> str:
+    """
+    Records that a chunk of the user's monthly risk budget was used,
+    updating the running total in HOT-tier state.
+    """
+    current = await get_state("risk_budget_this_month")
+    used_so_far = current.get("used_usd", 0) if current else 0
+    new_total = used_so_far + amount_usd
+
+    await set_state(
+        "risk_budget_this_month",
+        {"used_usd": new_total, "last_note": note},
+    )
+
+    return f"Risk budget updated: ${new_total:.2f} used so far this month (just added ${amount_usd:.2f} for: {note})"
+
+
+async def paid_web_search(query: str) -> str:
     """
     Performs a real web search by autonomously paying a small amount of
     USDC on Base to Exa's search API via the x402 protocol. Returns the
     results as a string, plus the on-chain transaction hash as proof.
+    Automatically logs the payment to the memory journal (COLD tier).
     """
     response = _paid_session.post(
         "https://api.exa.ai/search",
@@ -66,6 +84,14 @@ def paid_web_search(query: str) -> str:
     if payment_header:
         receipt = json.loads(base64.b64decode(payment_header))
         tx_hash = receipt.get("transaction")
+
+    # Automatically journal this on-chain payment -- not left up to the
+    # model's discretion, so the Base activity trail is always complete.
+    if tx_hash:
+        await record_event(
+            kind="paid_search",
+            body={"query": query, "tx_hash": tx_hash, "network": "base"},
+        )
 
     result = "Search results:\n" + "\n".join(lines)
     if tx_hash:
@@ -137,6 +163,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_risk_usage",
+            "description": (
+                "Record that a chunk of the user's monthly risk budget has "
+                "been used -- call this whenever you give investment advice "
+                "that involves a specific dollar amount of risk, so future "
+                "sessions know how much of the budget is already spent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount_usd": {"type": "number", "description": "Dollar amount of risk being logged."},
+                    "note": {"type": "string", "description": "Brief note on what this was for."},
+                },
+                "required": ["amount_usd", "note"],
+            },
+        },
+    },
 ]
 
 
@@ -155,7 +201,10 @@ async def run_tool(name: str, args: dict) -> str:
         return json.dumps(result)
 
     if name == "paid_web_search":
-        return paid_web_search(args["query"])
+        return await paid_web_search(args["query"])
+
+    if name == "log_risk_usage":
+        return await log_risk_usage(args["amount_usd"], args["note"])
 
     return f"Unknown tool: {name}"
 
@@ -173,21 +222,38 @@ async def load_known_facts() -> str:
     return "\n".join(lines)
 
 
+async def load_risk_budget() -> str:
+    """Pull the current risk-budget state (HOT tier) to seed the system prompt."""
+    state = await get_state("risk_budget_this_month")
+    if not state:
+        return "No risk budget usage has been logged yet this month ($0 used so far)."
+    used = state.get("used_usd", 0)
+    return f"Risk budget used so far this month: ${used:.2f} (last update: {state.get('last_note', 'n/a')})."
+
+
 async def main():
     print("MemoryPilot -- risk-aware investment assistant")
     print("Loading what I remember about you...\n")
 
     known_facts = await load_known_facts()
+    risk_budget = await load_risk_budget()
     print(known_facts)
+    print(risk_budget)
     print("\n(Type 'exit' to end the session.)\n")
 
     system_prompt = (
         "You are MemoryPilot, a cautious, helpful financial assistant. "
-        "You have persistent memory across sessions via tools. "
+        "You have persistent memory across sessions via tools, across three "
+        "tiers: entities (durable facts like preferences), state (fast-changing "
+        "running totals like a risk budget), and a journal (an append-only log "
+        "of decisions and on-chain payments). "
         "When the user states a preference, constraint, or important fact "
         "about themselves, call remember_fact to save it. "
-        "Use what you already know (below) to tailor every recommendation.\n\n"
-        f"{known_facts}"
+        "When you give advice involving a specific dollar amount of risk, "
+        "call log_risk_usage to update the running monthly total. "
+        "Use what you already know (below) to tailor every recommendation -- "
+        "in particular, factor the remaining risk budget into your advice.\n\n"
+        f"{known_facts}\n{risk_budget}"
     )
 
     messages = [{"role": "system", "content": system_prompt}]

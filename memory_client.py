@@ -86,3 +86,43 @@ async def list_all(category: str | None = None, limit: int = 50):
             if block.type == "text":
                 return json.loads(block.text)
         return None
+
+
+async def set_state(key: str, body: dict):
+    """Write a HOT-tier state document (fast, overwritten on each set)."""
+    async with sibyl_session() as session:
+        result = await session.call_tool(
+            "memory_set_state",
+            arguments={"key": key, "body": body},
+        )
+        return result
+
+
+async def get_state(key: str):
+    """
+    Read a HOT-tier state document. Returns the body dict, or None if
+    the key doesn't exist yet.
+    """
+    async with sibyl_session() as session:
+        result = await session.call_tool(
+            "memory_get_state",
+            arguments={"key": key},
+        )
+        import json
+        for block in result.content:
+            if block.type == "text":
+                data = json.loads(block.text)
+                if data.get("ok"):
+                    return data["body"]
+                return None
+        return None
+
+
+async def record_event(kind: str, body: dict, category: str | None = None, name: str | None = None):
+    """Append a COLD-tier journal event (append-only, never overwritten)."""
+    async with sibyl_session() as session:
+        result = await session.call_tool(
+            "memory_record_event",
+            arguments={"kind": kind, "body": body, "category": category, "name": name},
+        )
+        return result
